@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        DG radiance
-// @namespace   Isleward.Addon
+// @namespace   Addons
 // @match       https://play.isleward.com/*
 // @match       https://ptr.isleward.com/*
 // @version     1.2.7
