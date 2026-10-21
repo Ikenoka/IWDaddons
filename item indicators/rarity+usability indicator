@@ -1,6 +1,5 @@
 // ==UserScript==
 // @name        Rarity/Usability Indicator
-// @namespace   Addons
 // @match       https://play.isleward.com/*
 // @match       https://ptr.isleward.com/*
 // @version     2.7
@@ -29,8 +28,8 @@
 	// Thin line drawn tight around the sprite, between the sprite and the glow, in the slot's
 	// own background colour (so it reads as a clean gap before the glow starts).
 	const OUTLINE_ENABLED = true;
-	const OUTLINE_PX = 3;
-	const OUTLINE_COLOR = '#312136';
+	const OUTLINE_PX = 1;
+	const OUTLINE_COLOR = null;   // null = read the slot's real background colour from the page; or set e.g. '#2d2136'
 	const COLORS = {
 		0: '#fcfcfc',   // common    - white
 		1: '#51fc9a',   // magic     - green
@@ -62,14 +61,20 @@
 
 	// Styles key off the addon's own classes only, so they apply in every container.
 	const CSS = `
+	/* The :hover variants and !important keep the glow and outline in place when the game's own
+	   hover styles try to replace the sprite's filter. */
 	.rarityGlow .icon,
-	.rarityGlow.icon {
-		filter: ${OUTLINE_ENABLED ? outlineFilter() + ' ' : ''}drop-shadow(0 0 1px var(--rarity-glow)) drop-shadow(0 0 5px var(--rarity-glow)) drop-shadow(0 0 9px var(--rarity-glow));
+	.rarityGlow.icon,
+	.rarityGlow:hover .icon,
+	.rarityGlow .icon:hover,
+	.rarityGlow.icon:hover {
+		filter: ${OUTLINE_ENABLED ? outlineFilter() + ' ' : ''}drop-shadow(0 0 1px var(--rarity-glow)) drop-shadow(0 0 5px var(--rarity-glow)) drop-shadow(0 0 9px var(--rarity-glow)) !important;
 	}
 	.unusableMark {
 		position: relative;
 	}
-	.unusableMark::after {
+	.unusableMark::after,
+	.unusableMark:hover::after {
 		content: '';
 		position: absolute;
 		top: 0;
