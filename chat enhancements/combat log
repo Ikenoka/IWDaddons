@@ -1,9 +1,8 @@
 // ==UserScript==
 // @name        Combat Tab
-// @namespace   Addons
 // @match       https://play.isleward.com/*
 // @match       https://ptr.isleward.com/*
-// @version     1.2.0
+// @version     1.3.0
 // @author      Kara + Claude <3
 // @description Adds a "Combat" chat tab that logs every hit and heal dealt by or to you
 // @grant       none
@@ -16,6 +15,7 @@
  * involving you, showing who caused it, how much, and who received it:
  *
  *     You hit Crystal Spider for 142! fire damage      (crit: bold number with a "!")
+ *     You hit Crystal Spider for 6 534.4 fire damage   (thousands are separated with a space)
  *     Crystal Spider hit You for 23 physical damage
  *     Crystal Spider hit You — blocked
  *     Kara healed You for 56!
@@ -53,9 +53,12 @@
 	const SHOW_HEALS = true;           // log healing done by / to you
 	const SHOW_ELEMENT = true;         // "fire damage" instead of just "damage"
 	const SHOW_CRIT = true;            // crits get a bold number followed by !
+	const AMOUNT_DECIMALS = 1;         // amounts are rounded to this many decimals (trailing zeros are dropped)
+	const THOUSANDS_SEPARATOR = '\u00a0';  // between groups of three digits: 6 534.4 (a non-breaking space,
+	                                       // so a number is never split across two lines of chat)
 	const COLOR_DEALT = '#7be07b';     // hits you (or your pets) deal
 	const COLOR_TAKEN = '#ff6b6b';     // hits you (or your pets) take
-	const COLOR_HEAL = '#ffffff';      // healing done by / to you
+	const COLOR_HEAL = '#5fd0ff';      // healing done by / to you
 	const COLOR_NAME = '#e4e4ec';
 	const COLOR_AVOIDED = '#a6adb8';
 	const FLUSH_MS = 50;               // lines are delivered to the chat in small batches
@@ -178,12 +181,21 @@
 	}
 
 	// The damage number: coloured by element, and bold with a trailing ! on a crit
+	// 6534.44 -> "6 534.4" (rounded to AMOUNT_DECIMALS, whole-number digits grouped in threes)
+	function formatAmount(n) {
+		const scale = Math.pow(10, AMOUNT_DECIMALS);
+		const [whole, fraction] = String(Math.round(n * scale) / scale).split('.');
+		const grouped = whole.replace(/\B(?=(\d{3})+(?!\d))/g, THOUSANDS_SEPARATOR);
+
+		return fraction ? grouped + '.' + fraction : grouped;
+	}
+
 	function amountHtml(msg, fallbackColor) {
-		const amount = Math.round(msg.amount * 10) / 10;
+		const amount = formatAmount(msg.amount);
 		const crit = SHOW_CRIT && msg.crit;
 		const color = msg.element && msg.element !== 'default' ? elementColor(msg.element) : fallbackColor;
 
-		return span(color, String(amount) + (crit ? '!' : ''), crit);
+		return span(color, amount + (crit ? '!' : ''), crit);
 	}
 
 	function buildHealHtml(msg) {
