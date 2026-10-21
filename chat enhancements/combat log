@@ -1,0 +1,342 @@
+// ==UserScript==
+// @name        Combat Tab
+// @namespace   Addons
+// @match       https://play.isleward.com/*
+// @match       https://ptr.isleward.com/*
+// @version     1.2.0
+// @author      Kara + Claude <3
+// @description Adds a "Combat" chat tab that logs every hit and heal dealt by or to you
+// @grant       none
+// ==/UserScript==
+
+/*
+ * Combat Tab — Isleward addon
+ *
+ * Creates a chat tab called "Combat" and writes one line to it for every damage or healing event
+ * involving you, showing who caused it, how much, and who received it:
+ *
+ *     You hit Crystal Spider for 142! fire damage      (crit: bold number with a "!")
+ *     Crystal Spider hit You for 23 physical damage
+ *     Crystal Spider hit You — blocked
+ *     Kara healed You for 56!
+ *     You healed yourself for 31
+ *
+ * The damage number is coloured to match the damage's element (fire = red, frost = blue, ...).
+ *
+ * Where the data comes from
+ *   The server sends every hit to the client as an 'onGetDamage' event ({ id, source, amount,
+ *   element, crit, ... }, the same event that draws the floating damage numbers). The server only
+ *   sends it to players involved in the hit, so everything we see already concerns you or your
+ *   pets. 'id' is the recipient's object id and 'source' is the attacker's object id; both are
+ *   turned into names using the client's object list. Heals use the same event with heal: true,
+ *   where 'id' is the one healed and 'source' is the healer. Heals are only sent to the healer and
+ *   the one healed, so you'll see heals you cast and heals you receive (not your pets' heals).
+ *
+ * Works with both chat UIs
+ *   - iwd-chat mod  the tab is created with the 'onJoinChannel' event, the lines are sent with
+ *                   'onGetMessages' as custom-channel messages for that tab.
+ *   - stock chat    the same two events create a channel filter button; the filter starts
+ *                   switched off so combat spam doesn't flood the main window until you click it.
+ *
+ * Notes
+ *   - Closing the tab stops the log (it is not recreated until you log in again / reload).
+ *   - Damage lines count toward iwd-chat's retained message history (1000 lines in total, shared
+ *     between all tabs), so a long fight can push older chat out of the scrollback.
+ *   - The server doesn't tell the client which spell or weapon did the damage, only who did it,
+ *     so the "source" shown is the attacker's name.
+ */
+(function () {
+	// ---- Settings -----------------------------------------------------------
+	const TAB_NAME = 'Combat';         // must start with a capital letter (iwd-chat capitalizes labels)
+	const INCLUDE_PETS = true;         // also log hits dealt by / to your followers
+	const SHOW_AVOIDED = true;         // log hits that were blocked or dodged
+	const SHOW_HEALS = true;           // log healing done by / to you
+	const SHOW_ELEMENT = true;         // "fire damage" instead of just "damage"
+	const SHOW_CRIT = true;            // crits get a bold number followed by !
+	const COLOR_DEALT = '#7be07b';     // hits you (or your pets) deal
+	const COLOR_TAKEN = '#ff6b6b';     // hits you (or your pets) take
+	const COLOR_HEAL = '#ffffff';      // healing done by / to you
+	const COLOR_NAME = '#e4e4ec';
+	const COLOR_AVOIDED = '#a6adb8';
+	const FLUSH_MS = 50;               // lines are delivered to the chat in small batches
+	const POLL_MS = 500;               // how often we check the tab still exists
+	const MAX_BUFFER = 200;            // lines held back while the tab is still being created
+
+	// ---- Selectors (adjust here if the game's DOM changes) ------------------
+	const SEL_STOCK_FILTER = `.uiMessages .filter[filter="${TAB_NAME}"]`;
+	const SEL_STOCK_LIST = '.uiMessages .list';
+	const SEL_REACT_TABS = '.chat-tabs .tab';
+	// -------------------------------------------------------------------------
+
+	const CSS = `
+	/* stock chat: combat lines only show while the Combat filter is switched on */
+	.uiMessages .list .list-message.combatLog {
+		display: none;
+	}
+	.uiMessages .list.${TAB_NAME} .list-message.combatLog {
+		display: flex;
+	}
+	`;
+
+	let events = null;
+	let objects = null;
+	let seenTab = false;               // the tab has appeared in the DOM at least once
+	let lastJoinEmit = 0;
+	let buffer = [];                   // lines waiting to be flushed to the chat
+	let flushTimer = null;
+	const nameCache = new Map();       // object id -> last known name
+
+	function defer(method) {
+		if (window.$ && window.addons) method();
+		else setTimeout(() => defer(method), 50);
+	}
+
+	function injectCss() {
+		if (document.getElementById('combatTabStyle')) return;
+		const style = document.createElement('style');
+		style.id = 'combatTabStyle';
+		style.textContent = CSS;
+		document.head.appendChild(style);
+	}
+
+	// ---- Names --------------------------------------------------------------
+	function escapeHtml(s) {
+		return String(s)
+			.replace(/&/g, '&amp;')
+			.replace(/</g, '&lt;')
+			.replace(/>/g, '&gt;')
+			.replace(/"/g, '&quot;');
+	}
+
+	function nameOf(id) {
+		const playerId = window.player && window.player.id;
+		if (id === playerId) return 'You';
+
+		const list = (objects && objects.objects) || [];
+		const obj = list.find(o => o.id === id);
+
+		if (obj && obj.name) {
+			nameCache.set(id, obj.name);
+			return obj.name;
+		}
+
+		// The object may already be gone (killed by this very hit); fall back to what we saw before
+		return nameCache.get(id) || 'Unknown';
+	}
+
+	// ---- Tab management -----------------------------------------------------
+	function tabExists() {
+		if (document.querySelector(SEL_STOCK_FILTER)) return true;
+
+		return Array.from(document.querySelectorAll(SEL_REACT_TABS))
+			.some(t => t.textContent.trim().startsWith(TAB_NAME));
+	}
+
+	function isStockChat() {
+		return !!document.querySelector(SEL_STOCK_FILTER);
+	}
+
+	function requestTab() {
+		const now = Date.now();
+		if (now - lastJoinEmit < 1000) return;
+		lastJoinEmit = now;
+
+		// Both chat UIs listen to this event and create a tab / filter button for the channel
+		events.emit('onJoinChannel', TAB_NAME);
+	}
+
+	// Called once, the first time the tab shows up in the DOM
+	function onTabAppeared() {
+		seenTab = true;
+
+		if (isStockChat()) {
+			// The stock chat creates the filter switched on; start with it off so the
+			// main window isn't flooded. Clicking the button turns the log on.
+			window.$(SEL_STOCK_FILTER).removeClass('active');
+			window.$(SEL_STOCK_LIST).removeClass(TAB_NAME);
+		}
+
+		flush();
+	}
+
+	function checkTab() {
+		if (!window.player) return;
+
+		if (!seenTab) {
+			if (tabExists()) onTabAppeared();
+			else requestTab();
+		}
+	}
+
+	// ---- Message building ---------------------------------------------------
+	function span(color, text, bold) {
+		return '<span style="color:' + color + (bold ? ';font-weight:bold' : '') + '">' + escapeHtml(text) + '</span>';
+	}
+
+	function elementColor(element) {
+		return 'var(--color-element-' + (element || 'default') + ', #ffffff)';
+	}
+
+	// The damage number: coloured by element, and bold with a trailing ! on a crit
+	function amountHtml(msg, fallbackColor) {
+		const amount = Math.round(msg.amount * 10) / 10;
+		const crit = SHOW_CRIT && msg.crit;
+		const color = msg.element && msg.element !== 'default' ? elementColor(msg.element) : fallbackColor;
+
+		return span(color, String(amount) + (crit ? '!' : ''), crit);
+	}
+
+	function buildHealHtml(msg) {
+		const sourceName = nameOf(msg.source);
+		const targetName = nameOf(msg.id);
+		const self = msg.source === msg.id;
+
+		let html = span(COLOR_NAME, sourceName, true) + ' ' + span(COLOR_HEAL, 'healed') + ' ' +
+			(self ? span(COLOR_HEAL, sourceName === 'You' ? 'yourself' : 'themselves') : span(COLOR_NAME, targetName, true)) +
+			' ' + span(COLOR_HEAL, 'for') + ' ' + amountHtml(msg, COLOR_HEAL);
+
+		if (SHOW_ELEMENT && msg.element && msg.element !== 'default')
+			html += ' ' + span(elementColor(msg.element), msg.element);
+
+		return '<span>' + html + '</span>';
+	}
+
+	function buildHtml(msg, dealt) {
+		if (msg.heal) return buildHealHtml(msg);
+
+		const lineColor = dealt ? COLOR_DEALT : COLOR_TAKEN;
+		const source = span(COLOR_NAME, nameOf(msg.source), true);
+		const target = span(COLOR_NAME, nameOf(msg.id), true);
+		let html = source + ' ' + span(lineColor, 'hit') + ' ' + target + ' ';
+
+		if (msg.event) {
+			html += span(COLOR_AVOIDED, '\u2014 ' + msg.text);
+		} else {
+			html += span(lineColor, 'for') + ' ' + amountHtml(msg, elementColor('default'));
+
+			if (SHOW_ELEMENT && msg.element)
+				html += ' ' + span(elementColor(msg.element), msg.element);
+
+			html += ' ' + span(lineColor, 'damage');
+		}
+
+		// One wrapper element: the stock chat lays lines out with flexbox, which would otherwise
+		// drop the whitespace between our separate spans
+		return '<span>' + html + '</span>';
+	}
+
+	function buildChatMessage(html) {
+		if (isStockChat()) {
+			return {
+				class: 'combatLog',
+				type: 'combat',
+				channel: TAB_NAME,
+				message: html
+			};
+		}
+
+		// iwd-chat. A 'custom' sub-type with a matching channel puts the line in our tab only.
+		// 'target' stops iwd-chat from reclassifying a source-less line as an 'info' message
+		// (which would also show it in the Info tab).
+		return {
+			type: 'chat',
+			subType: 'custom',
+			channel: TAB_NAME,
+			target: TAB_NAME,
+			renderAsHtml: true,
+			message: html
+		};
+	}
+
+	// ---- Delivery -----------------------------------------------------------
+	function flush() {
+		flushTimer = null;
+		if (!buffer.length || !seenTab) return;
+
+		const lines = buffer;
+		buffer = [];
+
+		events.emit('onGetMessages', { messages: lines });
+	}
+
+	function queue(html) {
+		// Tab was there and is now gone: the player closed it, so stop logging
+		if (seenTab && !tabExists()) return;
+
+		buffer.push(buildChatMessage(html));
+		if (buffer.length > MAX_BUFFER) buffer.splice(0, buffer.length - MAX_BUFFER);
+
+		if (seenTab && !flushTimer) flushTimer = setTimeout(flush, FLUSH_MS);
+	}
+
+	// ---- Damage events ------------------------------------------------------
+	// Returns 'dealt', 'taken' or null (not relevant to the player)
+	function direction(msg) {
+		const pid = window.player && window.player.id;
+		if (pid === undefined || pid === null) return null;
+
+		// Taken wins when you hit yourself
+		if (msg.id === pid) return 'taken';
+		if (msg.source === pid) return 'dealt';
+
+		if (INCLUDE_PETS) {
+			if (msg.masterId === pid) return 'taken';
+			if (msg.masterSource === pid) return 'dealt';
+		}
+
+		return null;
+	}
+
+	function onGetDamage(msg) {
+		if (!msg) return;
+		if (msg.heal && !SHOW_HEALS) return;
+
+		// Floating text events (xp, loot, level up, ...) have no source; blocked / dodged do
+		if (msg.event) {
+			if (!SHOW_AVOIDED) return;
+			if (msg.text !== 'blocked' && msg.text !== 'dodged') return;
+		} else if (typeof msg.amount !== 'number') {
+			return;
+		}
+
+		if (msg.source === undefined || msg.source === null) return;
+
+		const dir = direction(msg);
+		if (!dir) return;
+
+		queue(buildHtml(msg, dir === 'dealt'));
+	}
+
+	// ---- Addon registration -------------------------------------------------
+	defer(() => {
+		window.addons.register({
+			init: function (props) {
+				events = props.events;
+				objects = props.objects;
+
+				injectCss();
+
+				events.on('onGetDamage', onGetDamage);
+
+				// A new character session needs its tab recreated
+				events.on('onGetPlayer', () => {
+					seenTab = false;
+					lastJoinEmit = 0;
+					setTimeout(checkTab, 250);
+				});
+
+				// iwd-chat mounts its UI after we do and announces itself
+				events.on('onReactUiReady', arg => {
+					if (arg && arg.type === 'chat') {
+						seenTab = false;
+						lastJoinEmit = 0;
+						setTimeout(checkTab, 250);
+					}
+				});
+
+				setInterval(checkTab, POLL_MS);
+				checkTab();
+			}
+		});
+	});
+})();
