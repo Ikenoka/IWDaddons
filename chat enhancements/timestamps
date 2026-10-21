@@ -1,0 +1,156 @@
+// ==UserScript==
+// @name        Chat Timestamps
+// @namespace   Addons
+// @match       https://play.isleward.com/*
+// @match       https://ptr.isleward.com/*
+// @version     1.0.0
+// @author      Kara + Claude <3
+// @description Adds a timestamp to the start of every chat message
+// @grant       none
+// ==/UserScript==
+
+/*
+ * Chat Timestamps — Isleward addon
+ *
+ * Prefixes every chat line with the time it was received, e.g.  [14:32:07] Kara: hello
+ *
+ * Works with both chat UIs
+ *   - the stock jQuery chat   (.uiMessages .list .list-message)
+ *   - the iwd-chat mod        (.chat-messages .message), a React UI that re-renders its list
+ *
+ * How it works
+ *   A MutationObserver watches for new chat lines and writes the time into a data-cts attribute
+ *   on each one. The timestamp itself is drawn with a CSS ::before rule, so the addon never adds
+ *   or removes child nodes inside the game's own markup (important for React, which would get
+ *   confused by foreign nodes inside the elements it manages).
+ *
+ *   iwd-chat can unmount and remount old lines (scrolling back through history). Each React line
+ *   has a unique key, so the addon remembers key -> time and reuses the original time on remount.
+ *
+ *   If iwd-chat's own "Show Timestamps" option is turned on, this addon hides its stamp on those
+ *   lines so you never see two.
+ *
+ *   Only messages that arrive while the addon is running are stamped; lines already on screen
+ *   when it loads have no known time and are left alone.
+ */
+(function () {
+	// ---- Settings -----------------------------------------------------------
+	const USE_24H = true;              // false = 12-hour clock with am/pm
+	const SHOW_SECONDS = true;         // false = HH:MM only
+	const USE_UTC = false;             // true = UTC instead of your local time
+	const BRACKETS = true;             // [14:32:07] vs 14:32:07
+	const COLOR = '#9aa3ad';           // timestamp colour
+	const OPACITY = 0.85;
+	const MAX_REMEMBERED = 5000;       // cap on remembered React message times
+
+	// ---- Selectors (adjust here if the game's DOM changes) ------------------
+	const SEL_MESSAGES = '.uiMessages .list .list-message, .chat-messages .message';
+	const ATTR = 'data-cts';
+	// -------------------------------------------------------------------------
+
+	const CSS = `
+	${SEL_MESSAGES.split(',').map(s => s.trim() + '[' + ATTR + ']::before').join(',\n\t')} {
+		content: attr(${ATTR});
+		color: ${COLOR};
+		opacity: ${OPACITY};
+		white-space: nowrap;
+		flex: none;
+		margin-right: 6px;
+		font-variant-numeric: tabular-nums;
+	}
+	/* iwd-chat already draws its own timestamp when its option is on; don't double up */
+	.chat-messages .message:has(.message-timestamp)[${ATTR}]::before {
+		display: none;
+	}
+	`;
+
+	const knownTimes = new Map();      // React key -> epoch ms
+
+	function defer(method) {
+		if (window.$ && window.addons) method();
+		else setTimeout(() => defer(method), 50);
+	}
+
+	function injectCss() {
+		if (document.getElementById('chatTimestampsStyle')) return;
+		const style = document.createElement('style');
+		style.id = 'chatTimestampsStyle';
+		style.textContent = CSS;
+		document.head.appendChild(style);
+	}
+
+	const pad = n => String(n).padStart(2, '0');
+
+	function formatTime(date) {
+		let h = USE_UTC ? date.getUTCHours() : date.getHours();
+		const m = USE_UTC ? date.getUTCMinutes() : date.getMinutes();
+		const s = USE_UTC ? date.getUTCSeconds() : date.getSeconds();
+
+		let suffix = '';
+		if (!USE_24H) {
+			suffix = h >= 12 ? ' pm' : ' am';
+			h = h % 12 || 12;
+		}
+
+		const body = pad(h) + ':' + pad(m) + (SHOW_SECONDS ? ':' + pad(s) : '') + suffix;
+		return BRACKETS ? '[' + body + ']' : body;
+	}
+
+	// The React key of the element (iwd-chat uses the message id), or null for non-React lines
+	function getReactKey(el) {
+		const prop = Object.keys(el).find(k => k.startsWith('__reactFiber$'));
+		if (!prop) return null;
+		const fiber = el[prop];
+		return fiber && fiber.key !== null && fiber.key !== undefined ? String(fiber.key) : null;
+	}
+
+	function remember(key, time) {
+		knownTimes.set(key, time);
+		if (knownTimes.size > MAX_REMEMBERED) {
+			// Maps iterate in insertion order, so the first key is the oldest
+			knownTimes.delete(knownTimes.keys().next().value);
+		}
+	}
+
+	function stamp(el) {
+		if (el.hasAttribute(ATTR)) return;
+
+		const key = getReactKey(el);
+		let time;
+
+		if (key !== null && knownTimes.has(key)) {
+			time = knownTimes.get(key);
+		} else {
+			time = Date.now();
+			if (key !== null) remember(key, time);
+		}
+
+		el.setAttribute(ATTR, formatTime(new Date(time)));
+	}
+
+	function stampTree(node) {
+		if (node.nodeType !== 1) return;
+		if (node.matches(SEL_MESSAGES)) stamp(node);
+		if (node.firstElementChild) node.querySelectorAll(SEL_MESSAGES).forEach(stamp);
+	}
+
+	function watchChat() {
+		const observer = new MutationObserver(mutations => {
+			for (const mutation of mutations) {
+				for (const node of mutation.addedNodes) stampTree(node);
+			}
+		});
+
+		observer.observe(document.body, { childList: true, subtree: true });
+	}
+
+	// ---- Addon registration -------------------------------------------------
+	defer(() => {
+		window.addons.register({
+			init: function () {
+				injectCss();
+				watchChat();
+			}
+		});
+	});
+})();
