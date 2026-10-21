@@ -2,9 +2,9 @@
 // @name        Short Health & XP Numbers
 // @match       https://play.isleward.com/*
 // @match       https://ptr.isleward.com/*
-// @version     1.1.0
+// @version     1.2.0
 // @author      Kara + Claude <3
-// @description Shortens health numbers (HUD + selected target) and xp numbers (33111 -> 33.1k, 1100233 -> 1.1m)
+// @description Shortens health numbers (HUD + selected target) and xp / mastery numbers (33111 -> 33.1k, 1100233 -> 1.1m)
 // @grant       none
 // ==/UserScript==
 
@@ -26,8 +26,10 @@
  *   - health   the HUD health bar and the target frame health bar ("hp/hpMax")
  *   - xp       the floating "+1234 xp" text when you gain xp  -> "+1.2k xp"
  *              the "Next Level: 51,234 experience" line on the equipment tab -> "51.2k experience"
- *              the HUD xp bar text, if a mod makes it show numbers ("xp/xpMax"); the stock bar only
- *              says "level: N", which is left alone
+ *              the HUD xp bar text when it shows numbers, e.g. the mastery bar ("330/66,000" ->
+ *                "330/66.0k"); every number of 1000 or more in the text is shortened, whatever
+ *                the surrounding words are. The stock level bar only says "level: N" and is left alone
+ *              "Next Mastery Level: 1,200 experience" and any other "N experience" line on the equipment tab
  *   Hover tooltips keep the exact numbers.
  *
  * Where the data comes from
@@ -57,6 +59,7 @@
 	// ---- Selectors (adjust here if the game's DOM changes) ------------------
 	const SEL_HUD_TEXT = '.uiHud .statBox .statHp + .text';
 	const SEL_TARGET_TEXT = '.uiTarget .statBox .statHp + .text';
+	const ANY_NUMBER = /\d[\d,]*(?:\.\d+)?/g;
 	const SEL_XP_TEXT = '.uiHud .statBox .statXp + .text';
 	const SEL_EQUIPMENT_STAT = '.uiEquipment .stat font';
 	// -------------------------------------------------------------------------
@@ -113,6 +116,18 @@
 		if (next !== null) el.textContent = next;
 	}
 
+	// Every number in the text, with or without thousands separators: "330/66,000" -> "330/66.0k"
+	function applyXpBar(el) {
+		const text = el.textContent;
+		const next = text.replace(ANY_NUMBER, token => {
+			const value = Number(token.replace(/,/g, ''));
+
+			return isFinite(value) && value >= 1000 ? shorten(value) : token;
+		});
+
+		if (next !== text) el.textContent = next;
+	}
+
 	// "51,234 experience" -> "51.2k experience" (the game writes the number with thousands separators)
 	function applyNextLevel(el) {
 		const match = NEXT_LEVEL_FORMAT.exec(el.textContent.trim());
@@ -134,7 +149,6 @@
 		const list = [];
 		if (SHORTEN_HUD) list.push(SEL_HUD_TEXT);
 		if (SHORTEN_TARGET) list.push(SEL_TARGET_TEXT);
-		if (SHORTEN_XP) list.push(SEL_XP_TEXT);
 
 		return list.join(',');
 	}
@@ -142,6 +156,7 @@
 	function start() {
 		const selector = hudSelectors();
 		if (!selector && !SHORTEN_XP) return;
+		const xpSelector = SHORTEN_XP ? SEL_XP_TEXT : null;
 
 		// Our own rewrite also triggers the observer; it is ignored because "33.1k/48.2k" no longer
 		// matches the "number/number" format
@@ -157,6 +172,11 @@
 				if (selector && !done.has(el) && el.matches(selector)) {
 					done.add(el);
 					apply(el);
+				}
+
+				if (xpSelector && !done.has(el) && el.matches(xpSelector)) {
+					done.add(el);
+					applyXpBar(el);
 				}
 
 				// The equipment tab rebuilds its stat rows, so look inside whatever was added
@@ -175,6 +195,7 @@
 
 		// Catch anything already on screen when we start
 		if (selector) document.querySelectorAll(selector).forEach(apply);
+		if (xpSelector) document.querySelectorAll(xpSelector).forEach(applyXpBar);
 		if (SHORTEN_XP) document.querySelectorAll(SEL_EQUIPMENT_STAT).forEach(applyNextLevel);
 	}
 
