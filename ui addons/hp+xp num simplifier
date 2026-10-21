@@ -15,10 +15,10 @@
  * two full integers, and xp shows up in a few more places. This addon rewrites each number to the
  * highest unit that fits, with one decimal:
  *
- *     99399333  ->  99.4m        (k = thousand, m = million, b = billion, t = trillion)
- *     1100233   ->  1.1m
- *     33111     ->  33.1k
- *     113.3     ->  113.3        (anything under 1000 is left untouched)
+ *     99399333999  ->  99.4b        (k = thousand, m = million, b = billion, t = trillion)
+ *     1100233      ->  1.1m
+ *     33111        ->  33.1k
+ *     113.3        ->  113.3        (anything under 1000 is left untouched)
  *
  *     "33111/48200"  ->  "33.1k/48.2k"
  *
