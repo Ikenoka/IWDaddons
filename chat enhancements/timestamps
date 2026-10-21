@@ -1,6 +1,5 @@
 // ==UserScript==
 // @name        Chat Timestamps
-// @namespace   Addons
 // @match       https://play.isleward.com/*
 // @match       https://ptr.isleward.com/*
 // @version     1.0.0
