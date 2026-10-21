@@ -3,7 +3,7 @@
 // @namespace   Addons
 // @match       https://play.isleward.com/*
 // @match       https://ptr.isleward.com/*
-// @version     2.0
+// @version     2.7
 // @author      Kara + Claude <3
 // @description ADds a rarity glow around the item sprite, with an indicator for unequippable itemms in the top right
 // @grant       none
@@ -11,12 +11,13 @@
 /*
  * Rarity/Usability Indicator — Isleward addon
  *
- * Two indicators on item slots (inventory, equipment, anything rendered via renderItem):
- *   1. Rarity glow: a glow around the item sprite in its rarity colour.
+ * Two indicators on item slots (inventory, character screen, and any other panel that shows items):
+ *   1. Rarity glow: a faint glow around the item sprite in its rarity colour, separated from
+ *      the sprite by a thin line in the slot's background colour.
  *   2. Usability marker: a small red square in the slot's top-right corner when the item's
  *      level is above your level, or any of its str/dex/int requirements exceeds your
  *      character's value of that stat.
- * Standalone: no dependency on the other  addons.
+ * Standalone: no dependency on other addons.
  */
 (function () {
 	// ---- Settings: rarity glow ----------------------------------------------
@@ -24,6 +25,12 @@
 	// NOTE: these hex values are from memory of Isleward's palette - tweak if a shade looks off.
 	const GLOW_ENABLED = true;
 	const GLOW_COMMON = false;    // set true to also glow common (white) items
+	const GLOW_OPACITY = 1;    // 0..1; low = barely visible. Applied to each of the 3 glow layers.
+	// Thin line drawn tight around the sprite, between the sprite and the glow, in the slot's
+	// own background colour (so it reads as a clean gap before the glow starts).
+	const OUTLINE_ENABLED = true;
+	const OUTLINE_PX = 3;
+	const OUTLINE_COLOR = '#312136';
 	const COLORS = {
 		0: '#fcfcfc',   // common    - white
 		1: '#51fc9a',   // magic     - green
@@ -38,17 +45,31 @@
 	const MARKER_COLOR = '#d93845';   // slightly darkened from my recollection of Isleward's red (#ff4252)
 
 	// ---- Selectors (adjust here if the game's DOM changes) ------------------
-	const SEL_SLOT = '.renderItem.item';
+	// Every item element in any UI panel (inventory, character screen, stash, trade, ...).
+	// Elements the game renders through its 'beforeRenderItem' event are handled directly,
+	// whatever their classes; this selector is the fallback / cleanup sweep.
+	const SEL_SLOT = '.ui-container .item, .renderItem.item';
 	// -------------------------------------------------------------------------
 
-	const CSS = `
-	${SEL_SLOT}.Quality .icon {
-		filter: drop-shadow(0 0 1px var(---q)) drop-shadow(0 0 3px var(---q)) drop-shadow(0 0 5px var(---q));
+	// Four hard (unblurred) shadows, one per direction, chained so they merge into a solid
+	// line of OUTLINE_PX around the sprite's silhouette. Drawn first, so it sits closest.
+	function outlineFilter() {
+		const o = 'var(--rarity-outline, transparent)';
+		return [[OUTLINE_PX, 0], [-OUTLINE_PX, 0], [0, OUTLINE_PX], [0, -OUTLINE_PX]]
+			.map(([x, y]) => 'drop-shadow(' + x + 'px ' + y + 'px 0 ' + o + ')')
+			.join(' ');
 	}
-	${SEL_SLOT}.Unusable {
+
+	// Styles key off the addon's own classes only, so they apply in every container.
+	const CSS = `
+	.rarityGlow .icon,
+	.rarityGlow.icon {
+		filter: ${OUTLINE_ENABLED ? outlineFilter() + ' ' : ''}drop-shadow(0 0 1px var(--rarity-glow)) drop-shadow(0 0 5px var(--rarity-glow)) drop-shadow(0 0 9px var(--rarity-glow));
+	}
+	.unusableMark {
 		position: relative;
 	}
-	${SEL_SLOT}.Unusable::after {
+	.unusableMark::after {
 		content: '';
 		position: absolute;
 		top: 0;
@@ -69,20 +90,27 @@
 	}
 
 	function injectCss() {
-		if (document.getElementById('RarityUsabilityStyle')) return;
+		if (document.getElementById('rarityUsabilityStyle')) return;
 		const style = document.createElement('style');
-		style.id = 'RarityUsabilityStyle';
+		style.id = 'rarityUsabilityStyle';
 		style.textContent = CSS;
 		document.head.appendChild(style);
 	}
 
 	// ---- Rarity -------------------------------------------------------------
-	function qualityColor(item) {
+	function hexToRgba(hex, alpha) {
+		const m = /^#?([0-9a-f]{6})$/i.exec(hex);
+		if (!m) return null;
+		const n = parseInt(m[1], 16);
+		return 'rgba(' + ((n >> 16) & 255) + ',' + ((n >> 8) & 255) + ',' + (n & 255) + ',' + alpha + ')';
+	}
+
+	function qualityGlow(item) {
 		if (!GLOW_ENABLED || !item) return null;
 		const q = Number(item.quality);
 		if (!Number.isFinite(q)) return null;
 		if (q === 0 && !GLOW_COMMON) return null;
-		return COLORS[q] || null;
+		return COLORS[q] ? hexToRgba(COLORS[q], GLOW_OPACITY) : null;
 	}
 
 	// ---- Usability ----------------------------------------------------------
@@ -131,24 +159,43 @@
 	}
 
 	// ---- Apply to a slot ----------------------------------------------------
+	// The slot's own background colour; if the slot itself is transparent, the nearest
+	// ancestor that has one.
+	function slotBackground(el) {
+		if (OUTLINE_COLOR) return OUTLINE_COLOR;
+		for (let node = el; node && node.nodeType === 1; node = node.parentElement) {
+			const bg = window.getComputedStyle(node).backgroundColor;
+			const m = /^rgba?\(([^)]+)\)$/.exec(bg || '');
+			if (!m) continue;
+			const parts = m[1].split(',').map(s => parseFloat(s));
+			if (parts.length < 4 || parts[3] > 0) return 'rgb(' + parts[0] + ',' + parts[1] + ',' + parts[2] + ')';
+		}
+		return null;
+	}
+
 	function applySlot(el, item) {
 		if (!el) return;
 		const $el = window.$(el);
-		const color = qualityColor(item);
-		if (color) {
-			$el.addClass('Quality');
-			el.style.setProperty('---q', color);
+		const glow = qualityGlow(item);
+		if (glow) {
+			$el.addClass('rarityGlow');
+			el.style.setProperty('--rarity-glow', glow);
+			const outline = OUTLINE_ENABLED ? slotBackground(el) : null;
+			if (outline) el.style.setProperty('--rarity-outline', outline);
+			else el.style.removeProperty('--rarity-outline');
 		} else {
-			$el.removeClass('Quality');
-			el.style.removeProperty('---q');
+			$el.removeClass('rarityGlow');
+			el.style.removeProperty('--rarity-glow');
+			el.style.removeProperty('--rarity-outline');
 		}
-		$el.toggleClass('Unusable', isUnusable(item));
+		$el.toggleClass('unusableMark', isUnusable(item));
 	}
 
 	function clearSlot(el) {
 		const $el = window.$(el);
-		$el.removeClass('Quality Unusable').removeData('IndItem');
-		el.style.removeProperty('---q');
+		$el.removeClass('rarityGlow unusableMark').removeData('indicatorItem');
+		el.style.removeProperty('--rarity-glow');
+		el.style.removeProperty('--rarity-outline');
 	}
 
 	// Fallback + cleanup: re-apply from each slot's stored item, and clear slots that went
@@ -157,10 +204,10 @@
 		window.$(SEL_SLOT).each(function () {
 			const $el = window.$(this);
 			if (this.classList.contains('empty')) {
-				if (this.classList.contains('Quality') || this.classList.contains('Unusable')) clearSlot(this);
+				if (this.classList.contains('rarityGlow') || this.classList.contains('unusableMark')) clearSlot(this);
 				return;
 			}
-			const item = $el.data('IndItem') || $el.data('item') || $el.find('.icon').data('item');
+			const item = $el.data('indicatorItem') || $el.data('item') || $el.find('.icon').data('item');
 			if (item && typeof item === 'object') applySlot(this, item);
 		});
 	}
@@ -195,9 +242,9 @@
 			onBeforeRenderItem: function (obj) {
 				if (!obj || !obj.el || !obj.item) return;
 				const { el, item } = obj;
-				el.data('IndItem', item);
+				el.data('indicatorItem', item);
 				const apply = () => {
-					if (el.data('IndItem') !== item) return; // slot re-rendered with another item
+					if (el.data('indicatorItem') !== item) return; // slot re-rendered with another item
 					applySlot(el[0], item);
 				};
 				apply();
@@ -208,7 +255,7 @@
 
 			onGetStats: function (stats) {
 				if (!stats) return;
-				// Stat events can be partial; merge them and re-check slots if str/dex/int changed.
+				// Stat events can be partial; merge them and re-check slots if str/dex/int/level changed.
 				const prev = playerStats || {};
 				const next = Object.assign({}, prev, stats);
 				const changed = REQ_STATS.concat('level').some(s => next[s] !== prev[s]);
