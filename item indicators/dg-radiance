@@ -21,7 +21,8 @@
  *   - an alert plays when the item enters your inventory, and which one depends on the tier:
  *     AlertSound3 at 160%+, AlertSound6 at 240%+, AlertSound1 at 320%+. These are
  *     the original recordings (the audio tracks of the mp4 files, copied out unchanged and
- *     embedded below as base64), with the old synthesized version kept as a fallback
+ *     embedded below as base64), with the old synthesized version kept as a fallback. The 
+ *     original recordings are property of Grinding Gear Games.
  *
  * Load this addon AFTER (or alongside) the DG Perf Tiers addon. It reads
  * item.dgTier lazily, after all other onGetItems handlers have run, so the
