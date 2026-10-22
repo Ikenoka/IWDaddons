@@ -1,0 +1,594 @@
+// ==UserScript==
+// @name        XP Tab
+// @match       https://play.isleward.com/*
+// @match       https://ptr.isleward.com/*
+// @version     2.0.0
+// @author      Kara + Claude <3
+// @description Adds an "XP" chat tab that logs the xp from every kill, the mob that gave it, and kills left to the next level / mastery level
+// @grant       none
+// ==/UserScript==
+
+/*
+ * XP Tab — Isleward addon
+ *
+ * Creates a chat tab called "XP" and writes one line for every xp gain:
+ *
+ *     Crystal Spider gave 1 420 xp (37 kills to level 12)
+ *     Crystal Spider gave 310 mastery xp (112 kills to mastery level 5)
+ *
+ * How it works (v2 — rewritten after reading the game source)
+ *   v1 listened for the "+N xp" floating text the server sends via 'onGetDamage'. That event is only
+ *   sent while you are BELOW max level (stats.js getXp returns early at max level), so a max level
+ *   character, where mastery xp is what counts, got no lines at all.
+ *
+ *   v2 watches your progress bar instead, the same numbers the HUD shows:
+ *     - It builds the HUD progression object exactly like the game does ({ current, max, label, type })
+ *       and emits the client hook 'onBeforeGetHudProgression' on it. A mastery mod replaces the values
+ *       in that hook (type 'mastery'), so one code path covers normal xp and mastery xp.
+ *     - Whenever the bar moves forward, the difference is the xp of that kill. A level up (bar wraps
+ *       around) is handled. Losing xp on death is ignored.
+ *     - Kills left = ceil((max - current) / this kill's xp). It assumes the next kill is worth the same.
+ *     - The mastery level number comes from the 'onBeforeGetEquipmentProgression' hook ("Mastery Level")
+ *       when the mod provides it, otherwise the line says "next mastery level".
+ *   The mob name is worked out from the mobs you (or your pets) hit just before the xp arrived: the
+ *   most recently hit mob that has since disappeared. xp from a kill you took no part in shows "Unknown".
+ *   Kills landing in the same server tick get one line each: the server sends a separate "+N xp"
+ *   event per kill, so those give exact amounts. Xp that has no per-kill event (mastery) is split evenly
+ *   across the mobs that died that tick and shown with a ~ (estimated).
+ *
+ *   If your server never sends progress through the hooks (no mastery mod at max level), the old
+ *   "+N xp" / "+N mastery xp" floating text is still used as a fallback, without the kills-left part.
+ *
+ * Troubleshooting
+ *   Run  xpTabDebug()  in the browser console to print what the addon sees right now, and
+ *   xpTabDebug(true)  to also log every damage/xp event and stats update as they arrive.
+ *
+ * Works with both chat UIs (iwd-chat and stock chat), exactly like Combat Tab.
+ */
+(function () {
+	// ---- Settings -----------------------------------------------------------
+	const TAB_NAME = 'XP';             // must start with a capital letter (iwd-chat capitalizes labels)
+	const SHOW_KILLS_LEFT = true;      // the "(37 kills to level 12)" part
+	const THOUSANDS_SEPARATOR = ' ';
+	const COLOR_XP = '#c58bff';
+	const COLOR_NAME = '#e4e4ec';
+	const COLOR_TEXT = '#a6adb8';
+	const COLOR_MASTERY = '#ffcf5f';
+	const HIT_MEMORY_MS = 10000;       // how long a hit target is remembered as a possible xp source
+	const NAME_DELAY_MS = 200;         // wait for the dead mob to leave the object list before naming it
+	const SETTLE_MS = 30;              // let every event of one server tick arrive before reading the bar
+	const SAMPLE_MS = 250;             // fallback sampling of the progress bar (events trigger it sooner)
+	const FLUSH_MS = 50;
+	const POLL_MS = 500;
+	const MAX_BUFFER = 200;
+
+	// ---- Selectors ----------------------------------------------------------
+	const SEL_STOCK_FILTER = `.uiMessages .filter[filter="${TAB_NAME}"]`;
+	const SEL_STOCK_LIST = '.uiMessages .list';
+	const SEL_REACT_TABS = '.chat-tabs .tab';
+	// -------------------------------------------------------------------------
+
+	const CSS = `
+	.uiMessages .list .list-message.xpLog {
+		display: none;
+	}
+	.uiMessages .list.${TAB_NAME} .list-message.xpLog {
+		display: flex;
+	}
+	`;
+
+	let events = null;
+	let objects = null;
+	let seenTab = false;
+	let lastJoinEmit = 0;
+	let buffer = [];
+	let flushTimer = null;
+	let snapshot = null;               // last progress reading
+	let sampleQueued = false;
+	let creditXp = [];                 // { amount, t } xp already logged from events, so the bar catching up later isn't logged twice
+	let pendingXp = [];                // { amount, mastery, t } floating-text xp events not yet matched to a bar change
+	let trace = false;
+	const nameCache = new Map();       // object id -> last known name
+	let recentHits = [];               // { id, name, t } targets hit by you / your pets
+
+	function defer(method) {
+		if (window.$ && window.addons) method();
+		else setTimeout(() => defer(method), 50);
+	}
+
+	function injectCss() {
+		if (document.getElementById('xpTabStyle')) return;
+		const style = document.createElement('style');
+		style.id = 'xpTabStyle';
+		style.textContent = CSS;
+		document.head.appendChild(style);
+	}
+
+	// ---- Names --------------------------------------------------------------
+	function escapeHtml(s) {
+		return String(s)
+			.replace(/&/g, '&amp;')
+			.replace(/</g, '&lt;')
+			.replace(/>/g, '&gt;')
+			.replace(/"/g, '&quot;');
+	}
+
+	function findObject(id) {
+		const list = (objects && objects.objects) || [];
+		return list.find(o => o.id === id);
+	}
+
+	function nameOf(id) {
+		const obj = findObject(id);
+		if (obj && obj.name) {
+			nameCache.set(id, obj.name);
+			return obj.name;
+		}
+		return nameCache.get(id) || 'Unknown';
+	}
+
+	// ---- Tab management -----------------------------------------------------
+	function tabExists() {
+		if (document.querySelector(SEL_STOCK_FILTER)) return true;
+
+		return Array.from(document.querySelectorAll(SEL_REACT_TABS))
+			.some(t => t.textContent.trim().startsWith(TAB_NAME));
+	}
+
+	function isStockChat() {
+		return !!document.querySelector(SEL_STOCK_FILTER);
+	}
+
+	function requestTab() {
+		const now = Date.now();
+		if (now - lastJoinEmit < 1000) return;
+		lastJoinEmit = now;
+
+		events.emit('onJoinChannel', TAB_NAME);
+	}
+
+	function onTabAppeared() {
+		seenTab = true;
+
+		if (isStockChat()) {
+			// Stock chat creates the filter switched on; start it off so the main window isn't flooded
+			window.$(SEL_STOCK_FILTER).removeClass('active');
+			window.$(SEL_STOCK_LIST).removeClass(TAB_NAME);
+		}
+
+		flush();
+	}
+
+	function checkTab() {
+		if (!window.player) return;
+
+		if (!seenTab) {
+			if (tabExists()) onTabAppeared();
+			else requestTab();
+		}
+	}
+
+	// ---- Formatting ---------------------------------------------------------
+	function span(color, text, bold) {
+		return '<span style="color:' + color + (bold ? ';font-weight:bold' : '') + '">' + escapeHtml(text) + '</span>';
+	}
+
+	function formatNumber(n) {
+		const rounded = Math.round(n * 10) / 10;
+		const [whole, fraction] = String(rounded).split('.');
+		const grouped = whole.replace(/\B(?=(\d{3})+(?!\d))/g, THOUSANDS_SEPARATOR);
+
+		return fraction ? grouped + '.' + fraction : grouped;
+	}
+
+	// ---- Reading the progress bar -------------------------------------------
+	function statValues() {
+		const p = window.player;
+		return (p && p.stats && p.stats.values) || null;
+	}
+
+	function toNumber(v) {
+		const n = Number(v);
+		return Number.isFinite(n) ? n : 0;
+	}
+
+	// Emitting an event nobody listens to would park it in the client's queue forever; only emit
+	// hooks that already have a listener (the HUD / equipment window register no-op ones)
+	function hasListener(name) {
+		return !!(events && events.events && events.events[name] && events.events[name].length);
+	}
+
+	// Same object the HUD builds (ui/templates/hud/progression.js); mods rewrite it in the hook
+	function readProgress() {
+		const stats = statValues();
+		if (!stats) return null;
+
+		const progression = {
+			current: stats.xp,
+			max: stats.xpMax,
+			label: 'level: ' + stats.level,
+			type: 'experience'
+		};
+
+		if (hasListener('onBeforeGetHudProgression')) {
+			try {
+				events.emit('onBeforeGetHudProgression', progression);
+			} catch (e) {
+				// A broken mod hook shouldn't take the addon down with it
+			}
+		}
+
+		return {
+			type: progression.type || 'experience',
+			current: Math.max(0, toNumber(progression.current)),
+			max: Math.max(0, toNumber(progression.max)),
+			label: String(progression.label || ''),
+			level: stats.level
+		};
+	}
+
+	// "Mastery Level" entry that a mastery mod adds to the equipment window's progression block
+	function readMasteryLevel() {
+		const stats = statValues();
+		if (!stats || !hasListener('onBeforeGetEquipmentProgression')) return null;
+
+		const progression = {
+			entries: { Level: stats.level },
+			highlighted: ['Level'],
+			tooltips: {}
+		};
+
+		try {
+			events.emit('onBeforeGetEquipmentProgression', {
+				inspection: null,
+				isInspecting: false,
+				progression,
+				stats
+			});
+		} catch (e) {
+			return null;
+		}
+
+		const level = Number(progression.entries['Mastery Level']);
+
+		return Number.isFinite(level) ? level : null;
+	}
+
+	// "Next Mastery Level" entry ("120 experience"): xp still needed, straight from the mastery mod
+	function readMasteryRemaining() {
+		const stats = statValues();
+		if (!stats || !hasListener('onBeforeGetEquipmentProgression')) return 0;
+
+		const progression = { entries: { Level: stats.level }, highlighted: ['Level'], tooltips: {} };
+
+		try {
+			events.emit('onBeforeGetEquipmentProgression', { inspection: null, isInspecting: false, progression, stats });
+		} catch (e) {
+			return 0;
+		}
+
+		const text = progression.entries['Next Mastery Level'];
+		const value = Number(String(text === undefined ? '' : text).replace(/[^\d.]/g, ''));
+
+		return Number.isFinite(value) ? value : 0;
+	}
+
+	function nextLevelLabel(progress) {
+		if (progress.type === 'mastery') {
+			const level = readMasteryLevel();
+			return level === null ? 'next mastery level' : 'mastery level ' + (level + 1);
+		}
+
+		if (progress.type === 'experience') return 'level ' + ((progress.level || 0) + 1);
+
+		return 'next level';
+	}
+
+	// ---- Hit tracking (to name the mob that gave the xp) --------------------
+	function trackHit(msg) {
+		const pid = window.player && window.player.id;
+		if (pid === undefined || pid === null) return;
+
+		const dealt = msg.source === pid || msg.masterSource === pid;
+		if (!dealt || msg.id === pid) return;
+
+		const name = nameOf(msg.id);
+		const now = Date.now();
+
+		recentHits = recentHits.filter(h => now - h.t < HIT_MEMORY_MS && h.id !== msg.id);
+		recentHits.push({ id: msg.id, name, t: now });
+	}
+
+	// The most recently hit target that is no longer around, else the most recently hit one
+	function claimMobName() {
+		const now = Date.now();
+		recentHits = recentHits.filter(h => now - h.t < HIT_MEMORY_MS);
+
+		let pick = null;
+		for (let i = recentHits.length - 1; i >= 0; i--) {
+			if (!findObject(recentHits[i].id)) {
+				pick = recentHits[i];
+				break;
+			}
+		}
+		if (!pick) pick = recentHits[recentHits.length - 1];
+		if (!pick) return 'Unknown';
+
+		recentHits = recentHits.filter(h => h !== pick);
+
+		return pick.name;
+	}
+
+	// ---- Logging a gain -----------------------------------------------------
+	function logGain(gain, isMastery, killsHtml, estimated) {
+		// The dead mob only leaves the object list a moment after the xp arrives, so name it later
+		setTimeout(() => {
+			const mobName = claimMobName();
+
+			const html = '<span>' +
+				span(COLOR_NAME, mobName, true) + ' ' + span(COLOR_TEXT, 'gave') + ' ' +
+				span(isMastery ? COLOR_MASTERY : COLOR_XP, (estimated ? '~' : '') + formatNumber(gain) + (isMastery ? ' mastery xp' : ' xp'), true) +
+				killsHtml +
+				'</span>';
+
+			queue(html);
+		}, NAME_DELAY_MS);
+	}
+
+	function killsLeftHtml(gain, needed, progress) {
+		if (!SHOW_KILLS_LEFT || !(needed > 0)) return '';
+
+		const kills = Math.ceil(needed / gain);
+
+		return ' ' + span(COLOR_TEXT, '(' + formatNumber(kills) + (kills === 1 ? ' kill' : ' kills') + ' to ' + nextLevelLabel(progress) + ')');
+	}
+
+	// Mobs you hit that have since vanished: the kills that probably produced this gain
+	function deadMobCount() {
+		const now = Date.now();
+
+		return recentHits.filter(h => now - h.t < HIT_MEMORY_MS && !findObject(h.id)).length;
+	}
+
+	// Splits one bar movement into one entry per kill.
+	// The server announces each kill's xp as its own "+N xp" event, so those give exact amounts.
+	// The bar only ever shows the final value of a tick, so whatever the events don't explain
+	// (mastery xp, which has no per-kill event) is split evenly over the mobs that died.
+	function splitGain(gain, isMastery) {
+		const now = Date.now();
+		const fresh = pendingXp.filter(e => now - e.t < 1000);
+		pendingXp = [];
+
+		const parts = fresh.map(e => ({ amount: e.amount, mastery: e.mastery, estimated: false }));
+		const explained = parts.reduce((sum, p) => sum + p.amount, 0);
+		const remainder = gain - explained;
+
+		if (remainder > 0.5) {
+			const mobs = Math.max(1, deadMobCount() - parts.length);
+
+			for (let i = 0; i < mobs; i++)
+				parts.push({ amount: Math.floor(remainder / mobs) + (i < remainder % mobs ? 1 : 0), mastery: isMastery, estimated: mobs > 1 });
+		}
+
+		return parts;
+	}
+
+	function sample() {
+		sampleQueued = false;
+
+		const now = readProgress();
+		if (!now) return;
+
+		const prev = snapshot;
+		snapshot = now;
+
+		const nowMs = Date.now();
+		creditXp = creditXp.filter(c => nowMs - c.t < 3000);
+
+		let gain = 0;
+		let wrapped = false;
+
+		// No comparison on the first reading, or when the bar changed meaning (e.g. switched to mastery)
+		if (prev && prev.type === now.type) {
+			gain = now.current - prev.current;
+
+			// The bar wrapped around: a level up (the max / level / label changed and the value dropped)
+			wrapped = now.current < prev.current &&
+				(now.level !== prev.level || now.max !== prev.max || now.label !== prev.label);
+			if (wrapped) gain = (prev.max - prev.current) + now.current;
+		}
+
+		const isMastery = now.type === 'mastery';
+		const barNeeded = now.max > 0 ? now.max - now.current : 0;
+
+		// Bar moved: one line per kill (events give exact amounts, the rest is split over the dead mobs)
+		if (gain > 0) {
+			// Part of the movement may already have been logged from mastery events a moment ago
+			while (gain > 0 && creditXp.length) {
+				const credit = creditXp.shift();
+				gain -= credit.amount;
+			}
+
+			if (gain > 0.5 || pendingXp.length)
+				emitParts(splitGain(Math.max(0, gain), isMastery), barNeeded, now, wrapped);
+
+			return;
+		}
+
+		// Bar did not move. Mastery events are announced on their own, so log them now; plain xp events
+		// wait for the bar (up to a second) when it is tracking, otherwise they're logged as they are
+		const ready = pendingXp.filter(e => e.mastery || !tracking());
+		pendingXp = pendingXp.filter(e => !ready.includes(e));
+		if (!ready.length) return;
+
+		const needed = (isMastery && barNeeded > 0) ? barNeeded : (ready[0].mastery ? readMasteryRemaining() : 0);
+		const parts = ready.map(e => ({ amount: e.amount, mastery: e.mastery, estimated: false }));
+
+		parts.forEach(part => creditXp.push({ amount: part.amount, t: Date.now() }));
+		emitParts(parts, needed, ready[0].mastery ? { type: 'mastery' } : now, false);
+	}
+
+	// Kills left after each kill = what is still needed now + what the later kills of this tick add
+	function emitParts(parts, neededNow, progress, wrapped) {
+		let laterGain = 0;
+		const lines = [];
+
+		for (let i = parts.length - 1; i >= 0; i--) {
+			const part = parts[i];
+			const needed = (wrapped && i < parts.length - 1) || !(neededNow > 0) ? 0 : neededNow + laterGain;
+
+			lines.unshift({ part, html: killsLeftHtml(part.amount, needed, progress) });
+			laterGain += part.amount;
+		}
+
+		lines.forEach(({ part, html }) => logGain(part.amount, part.mastery, html, part.estimated));
+	}
+
+	// Several stat updates can land in one tick; read the bar once for all of them
+	function scheduleSample() {
+		if (sampleQueued) return;
+		sampleQueued = true;
+		setTimeout(sample, SETTLE_MS);
+	}
+
+	function tracking() {
+		return !!(snapshot && snapshot.max > 0);
+	}
+
+	// ---- Floating-text fallback ---------------------------------------------
+	const UNITS = { '': 1, k: 1e3, m: 1e6, b: 1e9, t: 1e12 };
+	// The mastery mod announces each kill's mastery xp as a bare "+1135" floating text on you
+	const BARE_FORMAT = /^\s*\+\s*([\d.,]+)\s*([kmbt]?)\s*$/i;
+	const XP_FORMAT = /^\s*\+?\s*([\d.,]+)\s*([kmbt]?)\s*(mastery\s*)?xp\b/i;
+
+	function parseXpText(msg) {
+		if (!msg.event || typeof msg.text !== 'string') return null;
+
+		let match = XP_FORMAT.exec(msg.text);
+		let bare = false;
+
+		if (!match) {
+			const pid = window.player && window.player.id;
+			match = msg.id === pid ? BARE_FORMAT.exec(msg.text) : null;
+			bare = true;
+		}
+		if (!match) return null;
+
+		let amount = Number(match[1].replace(/,/g, '')) * UNITS[match[2].toLowerCase()];
+		if (typeof msg.exactAmount === 'number') amount = msg.exactAmount;
+		else if (typeof msg.amount === 'number') amount = msg.amount;
+		if (!isFinite(amount)) return null;
+
+		return { amount, mastery: bare || !!match[3] };
+	}
+
+	function onGetDamage(msg) {
+		if (!msg) return;
+
+		if (trace && msg.event) console.log('[XP Tab] onGetDamage event:', msg);
+
+		if (!msg.event && !msg.heal && typeof msg.id !== 'undefined') trackHit(msg);
+
+		const xp = parseXpText(msg);
+		if (!xp) return;
+
+		// Matched to the bar movement of the same tick (or logged alone when the bar can't tell us)
+		pendingXp.push({ amount: xp.amount, mastery: xp.mastery, t: Date.now() });
+		scheduleSample();
+	}
+
+	function onGetStats(values, blueprint) {
+		if (trace) console.log('[XP Tab] onGetStats:', blueprint && blueprint.values);
+
+		scheduleSample();
+	}
+
+	// ---- Delivery -----------------------------------------------------------
+	function buildChatMessage(html) {
+		if (isStockChat()) {
+			return { class: 'xpLog', type: 'xp', channel: TAB_NAME, message: html };
+		}
+
+		return {
+			type: 'chat',
+			subType: 'custom',
+			channel: TAB_NAME,
+			target: TAB_NAME,
+			renderAsHtml: true,
+			message: html
+		};
+	}
+
+	function flush() {
+		flushTimer = null;
+		if (!buffer.length || !seenTab) return;
+
+		const lines = buffer;
+		buffer = [];
+
+		events.emit('onGetMessages', { messages: lines });
+	}
+
+	function queue(html) {
+		// Tab was there and is now gone: the player closed it, so stop logging
+		if (seenTab && !tabExists()) return;
+
+		buffer.push(buildChatMessage(html));
+		if (buffer.length > MAX_BUFFER) buffer.splice(0, buffer.length - MAX_BUFFER);
+
+		if (seenTab && !flushTimer) flushTimer = setTimeout(flush, FLUSH_MS);
+	}
+
+	// ---- Addon registration -------------------------------------------------
+	window.xpTabDebug = function (traceEvents) {
+		if (typeof traceEvents === 'boolean') {
+			trace = traceEvents;
+			console.log('[XP Tab] event tracing ' + (trace ? 'on' : 'off'));
+		}
+
+		console.log('[XP Tab] stats.values:', statValues());
+		console.log('[XP Tab] progress bar reading:', readProgress());
+		console.log('[XP Tab] mastery level (equipment hook):', readMasteryLevel());
+		console.log('[XP Tab] last snapshot:', snapshot);
+		console.log('[XP Tab] tab present:', tabExists(), '| stock chat:', isStockChat());
+	};
+
+	defer(() => {
+		window.addons.register({
+			init: function (props) {
+				events = props.events;
+				objects = props.objects;
+
+				injectCss();
+
+				events.on('onGetDamage', onGetDamage);
+				events.on('onGetStats', onGetStats);
+				events.on('onRefreshHudProgression', scheduleSample);
+
+				events.on('onGetPlayer', () => {
+					seenTab = false;
+					lastJoinEmit = 0;
+					snapshot = null;
+					pendingXp = [];
+					creditXp = [];
+					setTimeout(checkTab, 250);
+					setTimeout(scheduleSample, 500);
+				});
+
+				events.on('onReactUiReady', arg => {
+					if (arg && arg.type === 'chat') {
+						seenTab = false;
+						lastJoinEmit = 0;
+						setTimeout(checkTab, 250);
+					}
+				});
+
+				setInterval(checkTab, POLL_MS);
+				setInterval(() => {
+					if (window.player) scheduleSample();
+				}, SAMPLE_MS);
+				checkTab();
+			}
+		});
+	});
+})();
