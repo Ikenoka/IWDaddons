@@ -2,7 +2,7 @@
 // @name        Short Health & XP Numbers
 // @match       https://play.isleward.com/*
 // @match       https://ptr.isleward.com/*
-// @version     1.2.0
+// @version     1.3.0
 // @author      Kara + Claude <3
 // @description Shortens health numbers (HUD + selected target) and xp / mastery numbers (33111 -> 33.1k, 1100233 -> 1.1m)
 // @grant       none
@@ -15,22 +15,28 @@
  * two full integers, and xp shows up in a few more places. This addon rewrites each number to the
  * highest unit that fits, with one decimal:
  *
- *     99399333999  ->  99.4b        (k = thousand, m = million, b = billion, t = trillion)
- *     1100233      ->  1.1m
- *     33111        ->  33.1k
- *     113.3        ->  113.3        (anything under 1000 is left untouched)
+ *     99399333  ->  99.4m        (k = thousand, m = million, b = billion, t = trillion)
+ *     1100233   ->  1.1m
+ *     33111     ->  33.1k
+ *     113.3     ->  113.3        (anything under 1000 is left untouched)
  *
  *     "33111/48200"  ->  "33.1k/48.2k"
  *
  * What is shortened
  *   - health   the HUD health bar and the target frame health bar ("hp/hpMax")
  *   - xp       the floating "+1234 xp" text when you gain xp  -> "+1.2k xp"
+ *              the bare mastery xp floating text "+1135" (sent on its own, with no "xp") -> "+1.1k"
  *              the "Next Level: 51,234 experience" line on the equipment tab -> "51.2k experience"
  *              the HUD xp bar text when it shows numbers, e.g. the mastery bar ("330/66,000" ->
  *                "330/66.0k"); every number of 1000 or more in the text is shortened, whatever
  *                the surrounding words are. The stock level bar only says "level: N" and is left alone
  *              "Next Mastery Level: 1,200 experience" and any other "N experience" line on the equipment tab
  *   Hover tooltips keep the exact numbers.
+ *
+ * Exact xp for other addons
+ *   When a floating xp text is shortened, the original number is kept on the event as msg.exactAmount
+ *   (the same field "Short & Circling Damage Numbers" uses for damage). Addons that run after this
+ *   one, like the XP Tab, read msg.exactAmount first and only parse the shortened text as a fallback.
  *
  * Where the data comes from
  *   The game writes the text itself (hud.js and target.js call .html(hp + '/' + hpMax) on the
@@ -66,6 +72,7 @@
 
 	const TEXT_FORMAT = /^\s*(-?\d+(?:\.\d+)?)\s*\/\s*(-?\d+(?:\.\d+)?)\s*$/;
 	const XP_GAIN_FORMAT = /^(\+\s*)(\d+(?:\.\d+)?)(\s*xp)$/i;                    // "+1234 xp"
+	const BARE_GAIN_FORMAT = /^(\+\s*)(\d+(?:\.\d+)?)()$/;                       // "+1135" (mastery xp)
 	const NEXT_LEVEL_FORMAT = /^(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)(\s+experience)$/;  // "51,234 experience"
 
 	function defer(method) {
@@ -137,12 +144,31 @@
 		if (next !== el.textContent) el.textContent = next;
 	}
 
-	// Floating text event ({ event: true, text: '+1234 xp' }); changes the message before it is drawn
+	// Floating text event: { event: true, text: '+1234 xp' } (xp) or { event: true, text: '+1135' } (mastery xp,
+	// sent on your own character). Changes the message before it is drawn and keeps the exact number
+	// in msg.exactAmount for addons that run later
 	function onGetDamage(msg) {
 		if (!msg || !msg.event || typeof msg.text !== 'string') return;
 
-		const match = XP_GAIN_FORMAT.exec(msg.text);
-		if (match) msg.text = match[1] + shorten(Number(match[2])) + match[3];
+		let match = XP_GAIN_FORMAT.exec(msg.text);
+
+		if (!match) {
+			// A bare "+N" is only xp when it is shown on you (heals are not events, but stay strict)
+			const playerId = window.player && window.player.id;
+			if (playerId === undefined || playerId === null || msg.id !== playerId) return;
+
+			match = BARE_GAIN_FORMAT.exec(msg.text);
+		}
+
+		if (!match) return;
+
+		const exact = Number(match[2]);
+		if (!isFinite(exact)) return;
+
+		// Don't overwrite an exact number an earlier handler already stored
+		if (typeof msg.exactAmount !== 'number') msg.exactAmount = exact;
+
+		msg.text = match[1] + shorten(exact) + match[3];
 	}
 
 	function hudSelectors() {
