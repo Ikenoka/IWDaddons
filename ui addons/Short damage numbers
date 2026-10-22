@@ -2,7 +2,7 @@
 // @name        Short & Circling Damage Numbers
 // @match       https://play.isleward.com/*
 // @match       https://ptr.isleward.com/*
-// @version     2.2.0
+// @version     2.2.1
 // @author      Kara + Claude <3
 // @description Shortens floating damage / healing numbers (33111 -> 33.1k) and places them counterclockwise around the target
 // @grant       none
@@ -114,6 +114,7 @@
 
 		// Game's getText() uses msg.text whenever msg.amount is undefined
 		if (Math.abs(msg.amount) >= 1000) {
+			msg.exactAmount = msg.amount;  // other addons (Combat Tab) can still read the real number
 			msg.text = (msg.heal ? '+' : '') + shorten(msg.amount);
 			delete msg.amount;
 		}
