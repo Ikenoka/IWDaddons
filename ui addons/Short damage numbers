@@ -1,0 +1,237 @@
+// ==UserScript==
+// @name        Short & Circling Damage Numbers
+// @match       https://play.isleward.com/*
+// @match       https://ptr.isleward.com/*
+// @version     2.2.0
+// @author      Kara + Claude <3
+// @description Shortens floating damage / healing numbers (33111 -> 33.1k) and places them counterclockwise around the target
+// @grant       none
+// ==/UserScript==
+
+/*
+ * Short & Circling Damage Numbers — Isleward addon
+ *
+ * 1) SHORT NUMBERS
+ *     99399333  ->  99.4m        (k = thousand, m = million, b = billion, t = trillion)
+ *     1100233   ->  1.1m
+ *     33111     ->  33.1k
+ *     113.3     ->  113.3        (anything under 1000 is left to the game, so it stays unchanged)
+ *     healing keeps its plus sign: +33111 -> +33.1k
+ *
+ * 2) CIRCLING
+ *     Damage and healing numbers are drawn on a ring around the recipient. The newest number always
+ *     appears at 3 o'clock; each new one pushes the older numbers a slot counterclockwise. When a number
+ *     expires, the older ones slide back clockwise to close the gap, so there are never gaps. If the ring
+ *     is full (SLOTS numbers), the new number competes for the last three slots: if it is no bigger than
+ *     all of the numbers there it expires at once, otherwise it replaces the smallest of them (the
+ *     older numbers behind it slide up to close the gap). Damage and healing compare by size.
+ *
+ * 3) LIFETIME (frames, depends on the size of the number)
+ *     under 1000   -> 35        under 25000  -> 70        25000 and up -> 105
+ *
+ * How it works
+ *   The game builds the floating text in rendering/numbers.js (module-private) from the
+ *   'onGetDamage' event. Two handlers are added to that event:
+ *     - one moved to the FRONT of the handler list: rewrites msg so the game draws the short text with
+ *       the lifetime above (the game positions the sprite by its width, so the text must be short before
+ *       it is built)
+ *     - one at the back: finds the sprite the game just added to the 'effects' layer and moves it into
+ *       a small wrapper container. The game keeps following the target and fading the sprite itself;
+ *       the wrapper only adds the offset that moves it from the game's spot onto the ring.
+ *   Nothing in the game's own code or data is modified.
+ */
+(function () {
+	// ---- Settings -----------------------------------------------------------
+	const DECIMALS = 1;               // digits after the point for shortened numbers
+	const DROP_TRAILING_ZERO = false; // true: 1.0m -> 1m
+	const UNITS = ['', 'k', 'm', 'b', 't'];
+
+	const SLOTS = 10;                 // numbers that fit on the ring (360 / SLOTS degrees apart)
+	const SLIDE_SPEED = 0.25;         // 0-1, how quickly numbers slide around to their slot
+	const CONTEST_SLOTS = 3;          // when the ring is full, a new number fights for one of this many last slots
+	const EVICT_FRAMES = 8;           // frames a replaced number takes to vanish
+	const RADIUS_X = 1.1;             // ring width, in tiles
+	const RADIUS_Y = 0.9;             // ring height, in tiles
+
+	// Lifetime in frames by size of the number: [below, frames]; the last row has no limit
+	const LIFETIMES = [[1000, 35], [25000, 70], [Infinity, 105]];
+	// -------------------------------------------------------------------------
+
+	function defer(method) {
+		if (typeof window === 'undefined') return;
+		if (window.$ && window.addons) method();
+		else setTimeout(() => defer(method), 50);
+	}
+
+	// 99399333 -> "99.4m"; numbers under 1000 come back exactly as given
+	function shorten(n) {
+		if (!isFinite(n) || Math.abs(n) < 1000) return String(n);
+
+		const sign = n < 0 ? '-' : '';
+		const scale = Math.pow(10, DECIMALS);
+		let value = Math.abs(n);
+		let unit = 0;
+
+		while (value >= 1000 && unit < UNITS.length - 1) {
+			value /= 1000;
+			unit++;
+		}
+
+		let rounded = Math.round(value * scale) / scale;
+
+		// 999.96k rounds to 1000.0k: move up one unit instead
+		if (rounded >= 1000 && unit < UNITS.length - 1) {
+			rounded = Math.round((rounded / 1000) * scale) / scale;
+			unit++;
+		}
+
+		let text = rounded.toFixed(DECIMALS);
+		if (DROP_TRAILING_ZERO && DECIMALS > 0) text = text.replace(/\.?0+$/, '');
+
+		return sign + text + UNITS[unit];
+	}
+
+	// ---- Ring ---------------------------------------------------------------
+	const rings = new Map();   // target id -> entries, newest first
+	let layer = null;          // the game's 'effects' layer
+	let objects = null;        // the game's object list
+	let pending = null;        // set by the front handler, consumed by the back handler
+
+	function getTtl(amount) {
+		const size = Math.abs(amount);
+
+		return LIFETIMES.find(([below]) => size < below)[1];
+	}
+
+	function frontHandler(msg) {
+		pending = null;
+		if (!msg || msg.event || typeof msg.amount !== 'number') return;
+
+		pending = { id: msg.id, amount: Math.abs(msg.amount), childCount: layer.children.length };
+
+		if (msg.ttl === undefined) msg.ttl = getTtl(msg.amount);
+		msg.movementDelta = [0, 0];  // the ring decides where the number sits
+
+		// Game's getText() uses msg.text whenever msg.amount is undefined
+		if (Math.abs(msg.amount) >= 1000) {
+			msg.text = (msg.heal ? '+' : '') + shorten(msg.amount);
+			delete msg.amount;
+		}
+	}
+
+	// Moves the wrapper so the sprite's centre lands on the ring slot, whatever spot the game gave it
+	function place(entry) {
+		const { wrapper, sprite, target, angle } = entry;
+
+		const cx = (target.x * scale) + (scale / 2) + (Math.cos(angle) * RADIUS_X * scale);
+		const cy = (target.y * scale) + (scale / 2) - (Math.sin(angle) * RADIUS_Y * scale);  // screen y points down
+
+		wrapper.x = cx - (sprite.width / 2) - sprite.x;
+		wrapper.y = cy - (sprite.height / 2) - sprite.y;
+	}
+
+	function backHandler() {
+		const info = pending;
+		pending = null;
+		if (!info) return;
+
+		// The game skips the number (damage numbers off, target not visible): nothing was added
+		if (layer.children.length <= info.childCount) return;
+
+		const target = objects.objects.find(o => o.id === info.id);
+		if (!target) return;
+
+		const sprite = layer.children[layer.children.length - 1];
+		const wrapper = new layer.constructor();
+		layer.addChild(wrapper);
+		wrapper.addChild(sprite);  // the game keeps positioning the sprite inside the wrapper
+
+		let ring = rings.get(info.id);
+		if (!ring) rings.set(info.id, ring = []);
+
+		const entry = { wrapper, sprite, target, angle: 0, fade: 1, evicted: false, amount: info.amount };
+
+		// Ring full: the new number has to beat the smallest of the last three slots, which it replaces.
+		// If it is smaller than all three it expires straight away
+		const live = ring.filter(e => !e.evicted);
+		if (live.length >= SLOTS) {
+			const smallest = live.slice(-CONTEST_SLOTS).reduce((min, e) => e.amount < min.amount ? e : min);
+
+			if (info.amount <= smallest.amount) {
+				entry.evicted = true;
+				entry.fade = 0;
+				wrapper.visible = false;
+				ring.push(entry);  // stays in the list only so it is cleaned up when the game removes it
+				return;
+			}
+
+			smallest.evicted = true;
+		}
+
+		// The newest number always starts at 3 o'clock; older ones are pushed counterclockwise
+		ring.unshift(entry);
+		place(entry);
+	}
+
+	function frame() {
+		rings.forEach((ring, id) => {
+			// The game removes the sprite from the wrapper when its life runs out
+			for (let i = ring.length - 1; i >= 0; i--) {
+				const entry = ring[i];
+				if (entry.sprite.parent === entry.wrapper) continue;
+
+				if (entry.wrapper.parent) entry.wrapper.parent.removeChild(entry.wrapper);
+				entry.wrapper.destroy();
+				ring.splice(i, 1);
+			}
+
+			if (!ring.length) {
+				rings.delete(id);
+				return;
+			}
+
+			// Slot 0 is 3 o'clock; each older number sits one slot further counterclockwise. When a number
+			// expires, the older ones slide back clockwise to close the gap
+			let rank = 0;
+			ring.forEach(entry => {
+				if (entry.evicted) {
+					entry.fade = Math.max(0, entry.fade - (1 / EVICT_FRAMES));
+					entry.wrapper.alpha = entry.fade;
+					entry.wrapper.visible = entry.fade > 0;
+				} else {
+					const goal = rank * 2 * Math.PI / SLOTS;
+					entry.angle += (goal - entry.angle) * SLIDE_SPEED;
+					rank++;
+				}
+
+				place(entry);
+			});
+		});
+
+		requestAnimationFrame(frame);
+	}
+
+	// ---- Addon registration -------------------------------------------------
+	defer(() => {
+		window.addons.register({
+			init: function (props) {
+				layer = props.rendererLayers.effects;
+				objects = props.objects;
+
+				// Front: rewrite msg before the game's handler builds the sprite
+				const front = props.events.on('onGetDamage', frontHandler);
+				const list = props.events.events.onGetDamage;
+				list.splice(list.indexOf(front), 1);
+				list.unshift(front);
+
+				// Back: runs after the game's handler, so the new sprite exists
+				props.events.on('onGetDamage', backHandler);
+
+				requestAnimationFrame(frame);
+			}
+		});
+	});
+
+	// Exposed for testing in a Node/console environment
+	if (typeof module !== 'undefined') module.exports = { shorten };
+})();
